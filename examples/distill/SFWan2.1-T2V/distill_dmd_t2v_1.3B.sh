@@ -20,20 +20,21 @@ export MASTER_PORT=29503
 export TOKENIZERS_PARALLELISM=false
 export WANDB_API_KEY=your_wandb_api_key
 export WANDB_BASE_URL="https://api.wandb.ai"
-export WANDB_MODE=online
+# export WANDB_MODE=online
+export WANDB_MODE=disabled
 export FASTVIDEO_ATTENTION_BACKEND=FLASH_ATTN
 
 # Configs
-NUM_GPUS=1
+NUM_GPUS=4
 
 # Model paths for Self-Forcing DMD distillation:
 GENERATOR_MODEL_PATH="wlsaidhi/SFWan2.1-T2V-1.3B-Diffusers"
 REAL_SCORE_MODEL_PATH="Wan-AI/Wan2.1-T2V-14B-Diffusers"  # Teacher model
 FAKE_SCORE_MODEL_PATH="Wan-AI/Wan2.1-T2V-1.3B-Diffusers"  # Critic model
 
-DATA_DIR=your_data_dir
-VALIDATION_DATASET_FILE=your_validation_data_dir
-# export CUDA_VISIBLE_DEVICES=4,5
+DATA_DIR="/mnt/fast-disks/hao_lab/yang/workplace/FastVideo/FastVideo/Wan-Syn_77x448x832_600k/"
+VALIDATION_DATASET_FILE="/mnt/fast-disks/hao_lab/yang/workplace/FastVideo/examples/distill/Wan2.1-T2V/Wan-Syn-Data-480P/validation_64.json"
+export CUDA_VISIBLE_DEVICES=0,1,2,3
 # IP=[MASTER NODE IP]
 
 training_args=(
