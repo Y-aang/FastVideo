@@ -265,3 +265,73 @@ class LocalAttention(nn.Module):
 
         output = self.attn_impl.forward(q, k, v, ctx_attn_metadata)
         return output
+
+class LocalAttention_VSA(nn.Module):
+    """Attention layer.
+    """
+
+    def __init__(self,
+                 num_heads: int,
+                 head_size: int,
+                 num_kv_heads: int | None = None,
+                 softmax_scale: float | None = None,
+                 causal: bool = False,
+                 supported_attention_backends: tuple[AttentionBackendEnum, ...]
+                 | None = None,
+                 **extra_impl_args) -> None:
+        super().__init__()
+        if softmax_scale is None:
+            self.softmax_scale = head_size**-0.5
+        else:
+            self.softmax_scale = softmax_scale
+        if num_kv_heads is None:
+            num_kv_heads = num_heads
+
+        dtype = get_compute_dtype()
+        attn_backend = get_attn_backend(
+            head_size,
+            dtype,
+            supported_attention_backends=supported_attention_backends)
+        impl_cls = attn_backend.get_impl_cls()
+        self.attn_impl = impl_cls(num_heads=num_heads,
+                                  head_size=head_size,
+                                  softmax_scale=self.softmax_scale,
+                                  num_kv_heads=num_kv_heads,
+                                  causal=causal,
+                                  **extra_impl_args)
+        self.num_heads = num_heads
+        self.head_size = head_size
+        self.num_kv_heads = num_kv_heads
+        self.backend = backend_name_to_enum(attn_backend.get_name())
+        self.dtype = dtype
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        gate_compress: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """
+        Apply local attention between query, key and value tensors.
+        
+        Args:
+            q (torch.Tensor): Query tensor of shape [batch_size, seq_len, num_heads, head_dim]
+            k (torch.Tensor): Key tensor of shape [batch_size, seq_len, num_heads, head_dim] 
+            v (torch.Tensor): Value tensor of shape [batch_size, seq_len, num_heads, head_dim]
+            
+        Returns:
+            torch.Tensor: Output tensor after local attention
+        """
+        # Check input shapes
+        assert q.dim() == 4 and k.dim() == 4 and v.dim(
+        ) == 4, "Expected 4D tensors"
+
+        forward_context: ForwardContext = get_forward_context()
+        ctx_attn_metadata = forward_context.attn_metadata
+        
+        print("ctx_attn_metadata: ", ctx_attn_metadata.variable_block_sizes.shape)
+        import pdb; pdb.set_trace()
+        # assert False
+        output = self.attn_impl.forward(q, k, v, gate_compress, ctx_attn_metadata)
+        return output

@@ -18,7 +18,8 @@ import torch.distributed as dist
 
 import fastvideo.envs as envs
 from fastvideo.attention import (DistributedAttention,
-                                 LocalAttention)
+                                 LocalAttention,
+                                 LocalAttention_VSA)
 from fastvideo.configs.models.dits import WanVideoConfig
 from fastvideo.distributed.parallel_state import get_sp_world_size
 from fastvideo.forward_context import get_forward_context
@@ -59,14 +60,24 @@ class CausalWanSelfAttention(nn.Module):
         self.max_attention_size = 32760 if local_attn_size == -1 else local_attn_size * 1560
 
         # Scaled dot product attention
-        self.attn = LocalAttention(
-            num_heads=num_heads,
-            head_size=self.head_dim,
-            dropout_rate=0,
-            softmax_scale=None,
-            causal=False,
-            supported_attention_backends=(AttentionBackendEnum.FLASH_ATTN,
-                                          AttentionBackendEnum.TORCH_SDPA))
+        self.attn_backend = envs.FASTVIDEO_ATTENTION_BACKEND
+        if self.attn_backend == 'VIDEO_SPARSE_ATTN':
+            self.attn = LocalAttention_VSA(
+                num_heads=num_heads,
+                head_size=self.head_dim,
+                dropout_rate=0,
+                softmax_scale=None,
+                causal=False,
+                supported_attention_backends=(AttentionBackendEnum.VIDEO_SPARSE_ATTN,))
+        else:
+            self.attn = LocalAttention(
+                num_heads=num_heads,
+                head_size=self.head_dim,
+                dropout_rate=0,
+                softmax_scale=None,
+                causal=False,
+                supported_attention_backends=(AttentionBackendEnum.FLASH_ATTN,
+                                            AttentionBackendEnum.TORCH_SDPA))
 
     def forward(self, 
                 q: torch.Tensor,
@@ -76,7 +87,8 @@ class CausalWanSelfAttention(nn.Module):
                 block_mask: BlockMask,
                 kv_cache: dict | None = None,
                 current_start: int = 0,
-                cache_start: int | None = None):
+                cache_start: int | None = None,
+                gate_compress: torch.Tensor | None = None):
         r"""
         Args:
             x(Tensor): Shape [B, L, num_heads, C / num_heads]
@@ -152,11 +164,19 @@ class CausalWanSelfAttention(nn.Module):
                 # logger.info("kv_cache['k'] is in comp graph: %s", kv_cache["k"].requires_grad or kv_cache["k"].grad_fn is not None)
                 kv_cache["k"][:, local_start_index:local_end_index] = roped_key
                 kv_cache["v"][:, local_start_index:local_end_index] = v
-            x = self.attn(
-                roped_query,
-                kv_cache["k"][:, max(0, local_end_index - self.max_attention_size):local_end_index],
-                kv_cache["v"][:, max(0, local_end_index - self.max_attention_size):local_end_index]
-            )
+            if self.attn_backend == 'VIDEO_SPARSE_ATTN':
+                x = self.attn(
+                    roped_query,
+                    kv_cache["k"][:, max(0, local_end_index - self.max_attention_size):local_end_index],
+                    kv_cache["v"][:, max(0, local_end_index - self.max_attention_size):local_end_index],
+                    gate_compress=gate_compress
+                )
+            else:
+                x = self.attn(
+                    roped_query,
+                    kv_cache["k"][:, max(0, local_end_index - self.max_attention_size):local_end_index],
+                    kv_cache["v"][:, max(0, local_end_index - self.max_attention_size):local_end_index]
+                )
             kv_cache["global_end_index"].fill_(current_end)
             kv_cache["local_end_index"].fill_(local_end_index)
 
@@ -301,6 +321,151 @@ class CausalWanTransformerBlock(nn.Module):
 
         return hidden_states
 
+class CausalWanTransformerBlock_VSA(nn.Module):
+
+    def __init__(self,
+                 dim: int,
+                 ffn_dim: int,
+                 num_heads: int,
+                 local_attn_size: int = -1,
+                 sink_size: int = 0,
+                 qk_norm: str = "rms_norm_across_heads",
+                 cross_attn_norm: bool = False,
+                 eps: float = 1e-6,
+                 added_kv_proj_dim: int | None = None,
+                 supported_attention_backends: tuple[AttentionBackendEnum, ...] | None = None,
+                 prefix: str = ""):
+        super().__init__()
+
+        # 1. Self-attention
+        self.norm1 = nn.LayerNorm(dim, eps, elementwise_affine=False)
+        self.to_q = ReplicatedLinear(dim, dim, bias=True)
+        self.to_k = ReplicatedLinear(dim, dim, bias=True)
+        self.to_v = ReplicatedLinear(dim, dim, bias=True)
+        self.to_gate_compress = ReplicatedLinear(dim, dim, bias=True)
+
+        self.to_out = ReplicatedLinear(dim, dim, bias=True)
+        self.attn1 = CausalWanSelfAttention(
+            dim,
+            num_heads,
+            local_attn_size=local_attn_size,
+            sink_size=sink_size,
+            qk_norm=qk_norm,
+            eps=eps)
+        self.hidden_dim = dim
+        self.num_attention_heads = num_heads
+        self.local_attn_size = local_attn_size
+        dim_head = dim // num_heads
+        if qk_norm == "rms_norm":
+            self.norm_q = RMSNorm(dim_head, eps=eps)
+            self.norm_k = RMSNorm(dim_head, eps=eps)
+        elif qk_norm == "rms_norm_across_heads":
+            # LTX applies qk norm across all heads
+            self.norm_q = RMSNorm(dim, eps=eps)
+            self.norm_k = RMSNorm(dim, eps=eps)
+        else:
+            print("QK Norm type not supported")
+            raise Exception
+        assert cross_attn_norm is True
+        self.self_attn_residual_norm = ScaleResidualLayerNormScaleShift(
+            dim,
+            norm_type="layer",
+            eps=eps,
+            elementwise_affine=True,
+            dtype=torch.float32)
+
+        # 2. Cross-attention
+        # Only T2V for now
+        self.attn2 = WanT2VCrossAttention(dim,
+                                            num_heads,
+                                            qk_norm=qk_norm,
+                                            eps=eps)
+        self.cross_attn_residual_norm = ScaleResidualLayerNormScaleShift(
+            dim,
+            norm_type="layer",
+            eps=eps,
+            elementwise_affine=False,
+            dtype=torch.float32)
+
+        # 3. Feed-forward
+        self.ffn = MLP(dim, ffn_dim, act_type="gelu_pytorch_tanh")
+        self.mlp_residual = ScaleResidual()
+
+        self.scale_shift_table = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        temb: torch.Tensor,
+        freqs_cis: tuple[torch.Tensor, torch.Tensor],
+        block_mask: BlockMask,
+        kv_cache: dict | None = None,
+        crossattn_cache: dict | None = None,
+        current_start: int = 0,
+        cache_start: int | None = None,
+    ) -> torch.Tensor:
+        # hidden_states.shape: [batch_size, seq_length, inner_dim]
+        # temb.shape: [batch_size, num_frames, 6, inner_dim]
+        if hidden_states.dim() == 4:
+            hidden_states = hidden_states.squeeze(1)
+        num_frames = temb.shape[1]
+        frame_seqlen = hidden_states.shape[1] // num_frames    
+        bs, seq_length, _ = hidden_states.shape
+        orig_dtype = hidden_states.dtype
+        # assert orig_dtype != torch.float32
+        e = self.scale_shift_table + temb
+        # e.shape: [batch_size, num_frames, 6, inner_dim]
+        assert e.shape == (bs, num_frames, 6, self.hidden_dim)
+        shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = e.chunk(
+            6, dim=2)
+        # *_msa.shape: [batch_size, num_frames, 1, inner_dim]
+        # assert shift_msa.dtype == torch.float32
+
+        # 1. Self-attention
+        norm_hidden_states = (self.norm1(hidden_states).unflatten(dim=1, sizes=(num_frames, frame_seqlen)) *
+                        (1 + scale_msa) + shift_msa).flatten(1, 2)
+        query, _ = self.to_q(norm_hidden_states)
+        key, _ = self.to_k(norm_hidden_states)
+        value, _ = self.to_v(norm_hidden_states)
+        gate_compress, _ = self.to_gate_compress(norm_hidden_states)
+
+        if self.norm_q is not None:
+            query = self.norm_q.forward_native(query)
+        if self.norm_k is not None:
+            key = self.norm_k.forward_native(key)
+
+        query = query.squeeze(1).unflatten(2, (self.num_attention_heads, -1))
+        key = key.squeeze(1).unflatten(2, (self.num_attention_heads, -1))
+        value = value.squeeze(1).unflatten(2, (self.num_attention_heads, -1))
+        gate_compress = gate_compress.squeeze(1).unflatten(
+            2, (self.num_attention_heads, -1))
+
+        attn_output = self.attn1(query, key, value, freqs_cis, block_mask, kv_cache, 
+                                current_start, cache_start, gate_compress=gate_compress)
+        attn_output = attn_output.flatten(2)
+        attn_output, _ = self.to_out(attn_output)
+        attn_output = attn_output.squeeze(1)
+
+        null_shift = null_scale = torch.tensor([0], device=hidden_states.device)
+        norm_hidden_states, hidden_states = self.self_attn_residual_norm(
+            hidden_states, attn_output, gate_msa, null_shift, null_scale)
+
+        # 2. Cross-attention
+        attn_output = self.attn2(norm_hidden_states,
+                                 context=encoder_hidden_states,
+                                 context_lens=None,
+                                 crossattn_cache=crossattn_cache)
+        norm_hidden_states, hidden_states = self.cross_attn_residual_norm(
+            hidden_states, attn_output, 1, c_shift_msa, c_scale_msa)
+
+        # 3. Feed-forward
+        ff_output = self.ffn(norm_hidden_states)
+        hidden_states = self.mlp_residual(hidden_states, ff_output, c_gate_msa)
+
+        return hidden_states
+
+
 class CausalWanTransformer3DModel(BaseDiT):
     _fsdp_shard_conditions = WanVideoConfig()._fsdp_shard_conditions
     _compile_conditions = WanVideoConfig()._compile_conditions
@@ -340,8 +505,10 @@ class CausalWanTransformer3DModel(BaseDiT):
         )
 
         # 3. Transformer blocks
+        attn_backend = envs.FASTVIDEO_ATTENTION_BACKEND
+        transformer_block = CausalWanTransformerBlock_VSA if attn_backend == "VIDEO_SPARSE_ATTN" else CausalWanTransformerBlock
         self.blocks = nn.ModuleList([
-            CausalWanTransformerBlock(inner_dim,
+            transformer_block(inner_dim,
                               config.ffn_dim,
                               config.num_attention_heads,
                               config.local_attn_size,
@@ -371,7 +538,7 @@ class CausalWanTransformer3DModel(BaseDiT):
         # Causal-specific
         self.block_mask = None
         self.num_frame_per_block = config.arch_config.num_frames_per_block
-        assert self.num_frame_per_block <= 3
+        # assert self.num_frame_per_block <= 3
         self.independent_first_frame = False
 
         self.__post_init__()
