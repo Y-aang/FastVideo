@@ -4,7 +4,7 @@ try:
 except ImportError:
     block_sparse_fwd = None
     block_sparse_bwd = None
-from vsa.block_sparse_attn_triton import triton_block_sparse_attn_forward, triton_block_sparse_attn_backward
+from .block_sparse_attn_triton import triton_block_sparse_attn_forward, triton_block_sparse_attn_backward
 assert torch.__version__ >= "2.4.0", "VSA requires PyTorch 2.4.0 or higher"
 from vsa.index import map_to_index
 from typing import Tuple, Optional

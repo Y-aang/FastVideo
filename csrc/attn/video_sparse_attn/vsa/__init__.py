@@ -1,6 +1,6 @@
 import torch
 from typing import Tuple
-block_sparse_attn=None
+# block_sparse_attn=None
 import torch
 major, minor = torch.cuda.get_device_capability(0)
 # if major == 9 and minor == 0:# check if H100      # TODO: VSA SF, rRecover
@@ -15,7 +15,7 @@ major, minor = torch.cuda.get_device_capability(0)
 #     block_sparse_bwd = None
 #     block_sparse_attn = block_sparse_attn_triton
 
-from vsa.block_sparse_wrapper import block_sparse_attn_triton
+from .block_sparse_wrapper import block_sparse_attn_triton
 block_sparse_fwd = None
 block_sparse_bwd = None
 block_sparse_attn = block_sparse_attn_triton

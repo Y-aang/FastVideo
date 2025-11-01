@@ -157,7 +157,7 @@ def _attn_bwd_dkdv(dk, dv,  #
                    M, D,  #
                    k2q_index, k2q_num, max_q_blks,
                    variable_block_sizes,
-                   # shared by Q/K/V/DO.
+                   # strides for Q
                    stride_tok, stride_d,  #
                    H, N_CTX, BLOCK_M1: tl.constexpr,  #
                    BLOCK_N1: tl.constexpr,  #
@@ -220,6 +220,7 @@ def _attn_bwd_dq(dq, q, K, V,  #
                  # shared by Q/K/V/DO.
                  q2k_index, q2k_num, max_kv_blks,
                  variable_block_sizes,
+                 # stride for KV
                  stride_tok, stride_d,  #
                  H, N_CTX,  #
                  BLOCK_M2: tl.constexpr,  #
@@ -370,8 +371,145 @@ def _attn_bwd(Q, K, V, sm_scale,  #
     dq_ptrs = DQ + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d
     dq *= LN2
     tl.store(dq_ptrs, dq)
-    
-    
+
+
+
+@triton.jit
+def _attn_bwd_dkdv_kernel(Q, K, V, sm_scale,
+                          DO,
+                          DQ, DK, DV,
+                          M, D,
+                          k2q_index, k2q_num, max_q_blks,
+                          variable_block_sizes,
+
+                          q_stride_z, q_stride_h, q_stride_tok, q_stride_d,
+                          k_stride_z, k_stride_h, k_stride_tok, k_stride_d,
+                          v_stride_z, v_stride_h, v_stride_tok, v_stride_d,
+                          H, N_CTX_Q, N_CTX_KV,
+                          BLOCK_M1: tl.constexpr,
+                          BLOCK_N1: tl.constexpr,
+                          HEAD_DIM: tl.constexpr):
+    bhid = tl.program_id(2)
+    off_chz = (bhid * N_CTX_Q).to(tl.int64)
+    q_adj = (q_stride_h * (bhid % H) + q_stride_z * (bhid // H)).to(tl.int64)
+    k_adj = (k_stride_h * (bhid % H) + k_stride_z * (bhid // H)).to(tl.int64)
+    v_adj = (v_stride_h * (bhid % H) + v_stride_z * (bhid // H)).to(tl.int64)
+    pid = tl.program_id(0)
+
+    # offset pointers for batch/head
+    Q += q_adj
+    K += k_adj
+    V += v_adj
+    DO += q_adj
+    DK += k_adj
+    DV += v_adj
+    M += off_chz
+    D += off_chz
+
+    # load scales
+    offs_k = tl.arange(0, HEAD_DIM)
+
+    start_n = pid * BLOCK_N1
+    start_m = 0
+
+    offs_n = start_n + tl.arange(0, BLOCK_N1)
+
+    dv = tl.zeros([BLOCK_N1, HEAD_DIM], dtype=tl.float32)
+    dk = tl.zeros([BLOCK_N1, HEAD_DIM], dtype=tl.float32)
+
+    # load K and V: they stay in SRAM throughout the inner loop.
+    k = tl.load(K + offs_n[:, None] * k_stride_tok + offs_k[None, :] * k_stride_d)
+    v = tl.load(V + offs_n[:, None] * v_stride_tok + offs_k[None, :] * v_stride_d)
+
+
+    num_steps = N_CTX_Q // BLOCK_M1
+
+    dk, dv = _attn_bwd_dkdv(
+        dk, dv,
+        Q, k, v, sm_scale,
+        DO,
+        M, D,
+        k2q_index, k2q_num, max_q_blks,
+        variable_block_sizes,
+        q_stride_tok, q_stride_d,
+        H, N_CTX_Q,
+        BLOCK_M1, BLOCK_N1, HEAD_DIM,
+        start_n, start_m, num_steps
+    )
+
+    dv_ptrs = DV + offs_n[:, None] * v_stride_tok + offs_k[None, :] * v_stride_d
+    tl.store(dv_ptrs, dv)
+
+    # Write back dK.
+    dk *= sm_scale
+    dk_ptrs = DK + offs_n[:, None] * k_stride_tok + offs_k[None, :] * k_stride_d
+    tl.store(dk_ptrs, dk)  
+
+
+
+@triton.jit
+def _attn_bwd_dq_kernel(Q, K, V, sm_scale,
+                          DO,
+                          DQ, DK, DV,
+                          M, D,
+                          q2k_index, q2k_num, max_kv_blks,
+                          variable_block_sizes,
+
+                          q_stride_z, q_stride_h, q_stride_tok, q_stride_d,
+                          k_stride_z, k_stride_h, k_stride_tok, k_stride_d,
+                          v_stride_z, v_stride_h, v_stride_tok, v_stride_d,
+                          H, N_CTX_Q, N_CTX_KV,
+                          BLOCK_M2: tl.constexpr,
+                          BLOCK_N2: tl.constexpr,
+                          HEAD_DIM: tl.constexpr):
+    LN2 = 0.6931471824645996  # = ln(2)
+
+    bhid = tl.program_id(2)
+    off_chz = (bhid * N_CTX_Q).to(tl.int64)
+    q_adj = (q_stride_h * (bhid % H) + q_stride_z * (bhid // H)).to(tl.int64)
+    k_adj = (k_stride_h * (bhid % H) + k_stride_z * (bhid // H)).to(tl.int64)
+    v_adj = (v_stride_h * (bhid % H) + v_stride_z * (bhid // H)).to(tl.int64)
+    pid = tl.program_id(0)
+
+    # offset pointers for batch/head
+    Q += q_adj
+    K += k_adj
+    V += v_adj
+    DO += q_adj
+    DQ += q_adj
+    M += off_chz
+    D += off_chz
+
+    # load scales
+    offs_k = tl.arange(0, HEAD_DIM)
+
+    # THIS BLOCK DOES DQ:
+    start_m = pid * BLOCK_M2
+    end_n = 0
+
+    offs_m = start_m + tl.arange(0, BLOCK_M2)
+
+    q = tl.load(Q + offs_m[:, None] * q_stride_tok + offs_k[None, :] * q_stride_d)
+    dq = tl.zeros([BLOCK_M2, HEAD_DIM], dtype=tl.float32)
+    do = tl.load(DO + offs_m[:, None] * q_stride_tok + offs_k[None, :] * q_stride_d)
+
+    m = tl.load(M + offs_m)
+    m = m[:, None]
+
+    num_steps = N_CTX_Q // BLOCK_N2
+    dq = _attn_bwd_dq(dq, q, K, V,
+                      do, m, D,
+                      q2k_index, q2k_num, max_kv_blks,
+                      variable_block_sizes,
+                      k_stride_tok, k_stride_d,
+                      H, N_CTX_Q,
+                      BLOCK_M2, BLOCK_N2, HEAD_DIM,
+                      start_m, end_n, num_steps
+                      )
+    # Write back dQ.
+    dq_ptrs = DQ + offs_m[:, None] * q_stride_tok + offs_k[None, :] * q_stride_d
+    dq *= LN2
+    tl.store(dq_ptrs, dq)
 
 
 
@@ -410,19 +548,22 @@ def triton_block_sparse_attn_backward(do, q, k, v, o, M, q2k_index, q2k_num, k2q
     dq = torch.empty_like(q)
     dk = torch.empty_like(k)
     dv = torch.empty_like(v)
-    BATCH, N_HEAD, N_CTX = q.shape[:3]
+    BATCH, N_HEAD, N_CTX_Q = q.shape[:3]
+    _, _, N_CTX_KV = k.shape[:3]
+
     BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2 = 32, 64, 64, 32
     RCP_LN2 = 1.4426950408889634  # = 1.0 / ln(2)
     arg_k = k
     arg_k = arg_k * (sm_scale * RCP_LN2)
     PRE_BLOCK = 64
-    assert N_CTX % PRE_BLOCK == 0
-    pre_grid = (N_CTX // PRE_BLOCK, BATCH * N_HEAD)
+    assert N_CTX_Q % PRE_BLOCK == 0
+    assert N_CTX_KV % PRE_BLOCK == 0
+    pre_grid = (N_CTX_Q // PRE_BLOCK, BATCH * N_HEAD)
     delta = torch.empty_like(M)
     _attn_bwd_preprocess[pre_grid](
         o, do,  #
         delta,  #
-        BATCH, N_HEAD, N_CTX,  #
+        BATCH, N_HEAD, N_CTX_Q,  #
         BLOCK_M=PRE_BLOCK, HEAD_DIM=D  #
     )
     
@@ -430,19 +571,52 @@ def triton_block_sparse_attn_backward(do, q, k, v, o, M, q2k_index, q2k_num, k2q
     max_q_blks = k2q_index.shape[-1]
     max_kv_blks = q2k_index.shape[-1]
     
-    grid = (N_CTX // BLOCK_N1, 1, BATCH * N_HEAD)
-    _attn_bwd[grid](
-        q, arg_k, v, sm_scale, do, dq, dk, dv,  #
-        M, delta,  #
-        q2k_index, q2k_num, max_kv_blks,
+    grid_dkdv = (N_CTX_KV // BLOCK_N1, 1, BATCH * N_HEAD)
+    _attn_bwd_dkdv_kernel[grid_dkdv](
+        q, arg_k, v, sm_scale,
+        do,
+        dq, dk, dv,
+        M, delta,
         k2q_index, k2q_num, max_q_blks,
         variable_block_sizes,
-        q.stride(0), q.stride(1), q.stride(2), q.stride(3),  #
-        N_HEAD, N_CTX,  #
-        BLOCK_M1=BLOCK_M1, BLOCK_N1=BLOCK_N1,  #
-        BLOCK_M2=BLOCK_M2, BLOCK_N2=BLOCK_N2,  #
-        HEAD_DIM=D  #
+        q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+        arg_k.stride(0), arg_k.stride(1), arg_k.stride(2), arg_k.stride(3),
+        v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+        N_HEAD, N_CTX_Q, N_CTX_KV,
+        BLOCK_M1=BLOCK_M1, BLOCK_N1=BLOCK_N1,
+        HEAD_DIM=D
     )
+
+    grid_dq = (N_CTX_Q // BLOCK_M2, 1, BATCH * N_HEAD)
+    _attn_bwd_dq_kernel[grid_dq](
+        q, arg_k, v, sm_scale,
+        do,
+        dq, dk, dv,
+        M, delta,
+        q2k_index, q2k_num, max_kv_blks,
+        variable_block_sizes,
+        q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+        arg_k.stride(0), arg_k.stride(1), arg_k.stride(2), arg_k.stride(3),
+        v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+        N_HEAD, N_CTX_Q, N_CTX_KV,
+        BLOCK_M2=BLOCK_M2, BLOCK_N2=BLOCK_N2,
+        HEAD_DIM=D
+    )
+
+
+    
+    # _attn_bwd[grid](
+    #     q, arg_k, v, sm_scale, do, dq, dk, dv,  #
+    #     M, delta,  #
+    #     q2k_index, q2k_num, max_kv_blks,
+    #     k2q_index, k2q_num, max_q_blks,
+    #     variable_block_sizes,
+    #     q.stride(0), q.stride(1), q.stride(2), q.stride(3),  #
+    #     N_HEAD, N_CTX,  #
+    #     BLOCK_M1=BLOCK_M1, BLOCK_N1=BLOCK_N1,  #
+    #     BLOCK_M2=BLOCK_M2, BLOCK_N2=BLOCK_N2,  #
+    #     HEAD_DIM=D  #
+    # )
 
     return dq, dk, dv
 
