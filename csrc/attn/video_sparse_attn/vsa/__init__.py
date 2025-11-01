@@ -3,15 +3,22 @@ from typing import Tuple
 block_sparse_attn=None
 import torch
 major, minor = torch.cuda.get_device_capability(0)
-if major == 9 and minor == 0:# check if H100
-    from vsa_cuda import block_sparse_fwd, block_sparse_bwd
-    from vsa.block_sparse_wrapper import block_sparse_attn_SM90
-    block_sparse_attn = block_sparse_attn_SM90
-else:
-    from vsa.block_sparse_wrapper import block_sparse_attn_triton
-    block_sparse_fwd = None
-    block_sparse_bwd = None
-    block_sparse_attn = block_sparse_attn_triton
+# if major == 9 and minor == 0:# check if H100      # TODO: VSA SF, rRecover
+#     print("[VSA] block_sparse_attn_SM90")
+#     from vsa_cuda import block_sparse_fwd, block_sparse_bwd
+#     from vsa.block_sparse_wrapper import block_sparse_attn_SM90
+#     block_sparse_attn = block_sparse_attn_SM90
+# else:
+#     print("[VSA] block_sparse_attn_triton")
+#     from vsa.block_sparse_wrapper import block_sparse_attn_triton
+#     block_sparse_fwd = None
+#     block_sparse_bwd = None
+#     block_sparse_attn = block_sparse_attn_triton
+
+from vsa.block_sparse_wrapper import block_sparse_attn_triton
+block_sparse_fwd = None
+block_sparse_bwd = None
+block_sparse_attn = block_sparse_attn_triton
 
 BLOCK_M = 64
 BLOCK_N = 64
@@ -42,12 +49,14 @@ def video_sparse_attn(q, k, v, variable_block_sizes, topk, block_size, compress_
     V1 of sparse attention. Include compress attn and sparse attn branch, use average pooling to compress. 
     Assume q, k, v is flattened in this way: [batch_size, num_heads, T//block_size[0], H//block_size[1], W//block_size[2], block_size[0], block_size[1], block_size[2]]
     """
-
     if isinstance(block_size, int):
         block_size = (block_size, block_size, block_size)
 
     block_elements = block_size[0] * block_size[1] * block_size[2]
     assert block_elements == 64
+    # from fpdb import ForkedPdb
+    # ForkedPdb().set_trace()
+    print(f"q.shape: {q.shape}")
     assert q.shape[2] % block_elements == 0
     batch_size, num_heads, seq_len, head_dim = q.shape
     # compress attn

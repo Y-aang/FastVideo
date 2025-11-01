@@ -331,7 +331,7 @@ class LocalAttention_VSA(nn.Module):
         ctx_attn_metadata = forward_context.attn_metadata
         
         print("ctx_attn_metadata: ", ctx_attn_metadata.variable_block_sizes.shape)
-        import pdb; pdb.set_trace()
+        # import pdb; pdb.set_trace()
         # assert False
         output = self.attn_impl.forward(q, k, v, gate_compress, ctx_attn_metadata)
         return output

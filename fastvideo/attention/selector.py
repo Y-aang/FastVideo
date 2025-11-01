@@ -119,6 +119,8 @@ def _cached_get_attn_backend(
     # get device-specific attn_backend
     from fastvideo.platforms import current_platform
 
+    # print("selected_backend:", selected_backend)
+    # print("supported_attention_backends:", supported_attention_backends)
     if selected_backend not in supported_attention_backends:
         selected_backend = None
     attention_cls = current_platform.get_attn_backend_cls(

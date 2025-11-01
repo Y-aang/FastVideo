@@ -6,7 +6,8 @@ from dataclasses import dataclass
 import torch
 
 try:
-    from vsa import video_sparse_attn
+    # from vsa import video_sparse_attn
+    from csrc.attn.video_sparse_attn.vsa import video_sparse_attn
 except ImportError:
     video_sparse_attn = None
 
