@@ -541,7 +541,8 @@ def triton_block_sparse_attn_forward(q, k, v, q2k_index, q2k_num, variable_block
 
 def triton_block_sparse_attn_backward(do, q, k, v, o, M, q2k_index, q2k_num, k2q_index, k2q_num, variable_block_sizes):
     assert do.is_contiguous()
-    assert q.stride() == k.stride() == v.stride() == o.stride() == do.stride()
+    assert k.stride() == v.stride()
+    assert q.stride() == o.stride() == do.stride()
     
     B, H, T, D = q.shape
     sm_scale = 1.0 / math.sqrt(D)

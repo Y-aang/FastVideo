@@ -60,7 +60,7 @@ def block_sparse_kernel_test_partial_q(Q, K, V, block_sparse_mask,
     k_padded = vsa_pad(K, non_pad_index, variable_block_sizes.shape[0], BLOCK_M)
     v_padded = vsa_pad(V, non_pad_index, variable_block_sizes.shape[0], BLOCK_M)
     output, _= block_sparse_attn(q_padded, k_padded, v_padded, block_sparse_mask, variable_block_sizes)
-    output = output[:, :, non_pad_index, :]
+    output = output[:, :, non_pad_index_q, :]
     output.backward(dO)
     return output, Q.grad, K.grad, V.grad
 
@@ -224,7 +224,7 @@ def generate_error_graphs(h, d, error_mode='all'):
         k = config["k"]
         description = config["description"]
         # results = check_correctness(h, d, num_blocks, k, error_mode=error_mode)
-        results = check_correctness_partial_q(h, d, num_blocks, k, error_mode=error_mode, q_blocks=num_blocks)
+        results = check_correctness_partial_q(h, d, num_blocks, k, error_mode=error_mode, q_blocks=4)
         print(f"{description:<20} {num_blocks:<8} {k:<4} "
               f"{results['gQ']['avg_diff']:<12.6e} {results['gQ']['max_diff']:<12.6e} "
               f"{results['gK']['avg_diff']:<12.6e} {results['gK']['max_diff']:<12.6e} "
