@@ -436,7 +436,7 @@ def _attn_bwd_dkdv_kernel(Q, K, V, sm_scale,
         k2q_index, k2q_num, max_q_blks,
         variable_block_sizes,
         q_stride_tok, q_stride_d,
-        H, N_CTX_Q,
+        H, N_CTX_KV,
         BLOCK_M1, BLOCK_N1, HEAD_DIM,
         start_n, start_m, num_steps
     )
