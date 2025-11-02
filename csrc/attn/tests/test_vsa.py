@@ -225,7 +225,7 @@ def generate_error_graphs(h, d, error_mode='all'):
         k = config["k"]
         description = config["description"]
         # results = check_correctness(h, d, num_blocks, k, error_mode=error_mode)
-        results = check_correctness_partial_q(h, d, num_blocks, k, error_mode=error_mode, q_blocks=num_blocks)
+        results = check_correctness_partial_q(h, d, num_blocks, k, error_mode=error_mode, q_blocks=4)
         print(f"{description:<20} {num_blocks:<8} {k:<4} "
               f"{results['gQ']['avg_diff']:<12.6e} {results['gQ']['max_diff']:<12.6e} "
               f"{results['gK']['avg_diff']:<12.6e} {results['gK']['max_diff']:<12.6e} "

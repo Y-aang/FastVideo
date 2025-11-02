@@ -30,7 +30,7 @@ configs = [
 ]
 
 # ──────────────────────────── SPARSE ADDITION BEGIN ───────────────────────────
-@triton.autotune(configs, key=["N_CTX", "HEAD_DIM"])
+@triton.autotune(configs, key=["N_CTX_Q", "N_CTX_KV", "HEAD_DIM"])
 @triton.jit
 def _attn_fwd_sparse(Q, K, V, sm_scale,                         #
                      q2k_index, q2k_num, max_kv_blks,           #
@@ -40,7 +40,7 @@ def _attn_fwd_sparse(Q, K, V, sm_scale,                         #
                      stride_kz, stride_kh, stride_kn, stride_kk,
                      stride_vz, stride_vh, stride_vk, stride_vn,
                      stride_oz, stride_oh, stride_om, stride_on,
-                     Z, H, N_CTX,                               #
+                     Z, H, N_CTX_Q, N_CTX_KV,                   #
                      HEAD_DIM: tl.constexpr,                    #
                      BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
                      STAGE: tl.constexpr):
@@ -54,37 +54,40 @@ def _attn_fwd_sparse(Q, K, V, sm_scale,                         #
     off_hz  = tl.program_id(1)          # fused (batch, head)
     b       = off_hz // H
     h       = off_hz %  H
-    q_tiles = N_CTX // BLOCK_M
+    q_tiles = N_CTX_Q // BLOCK_M
+    kv_tiles = N_CTX_KV // BLOCK_N
     meta_base = ((b * H + h) * q_tiles + q_blk)
 
     kv_blocks = tl.load(q2k_num  + meta_base)                 # int32
     kv_ptr    = q2k_index + meta_base * max_kv_blks           # ptr to list
 
     # ----- base pointers -----
-    qvk_off = (b.to(tl.int64) * stride_qz +
+    q_off = (b.to(tl.int64) * stride_qz +
                h.to(tl.int64) * stride_qh)
+    kv_off = (b.to(tl.int64) * stride_kz +
+               h.to(tl.int64) * stride_kh)
 
     Q_ptr = tl.make_block_ptr(
-        base=Q + qvk_off, shape=(N_CTX, HEAD_DIM),
+        base=Q + q_off, shape=(N_CTX_Q, HEAD_DIM),
         strides=(stride_qm, stride_qk),
         offsets=(q_blk * BLOCK_M, 0),
         block_shape=(BLOCK_M, HEAD_DIM), order=(1, 0))
 
     K_base = tl.make_block_ptr(
-        base=K + qvk_off, shape=(HEAD_DIM, N_CTX),
+        base=K + kv_off, shape=(HEAD_DIM, N_CTX_KV),
         strides=(stride_kk, stride_kn),
         offsets=(0, 0),
         block_shape=(HEAD_DIM, BLOCK_N), order=(0, 1))
 
     v_order: tl.constexpr = (0, 1) if V.dtype.element_ty == tl.float8e5 else (1, 0)
     V_base = tl.make_block_ptr(
-        base=V + qvk_off, shape=(N_CTX, HEAD_DIM),
+        base=V + kv_off, shape=(N_CTX_KV, HEAD_DIM),
         strides=(stride_vk, stride_vn),
         offsets=(0, 0),
         block_shape=(BLOCK_N, HEAD_DIM), order=v_order)
 
     O_ptr = tl.make_block_ptr(
-        base=Out + qvk_off, shape=(N_CTX, HEAD_DIM),
+        base=Out + q_off, shape=(N_CTX_Q, HEAD_DIM),
         strides=(stride_om, stride_on),
         offsets=(q_blk * BLOCK_M, 0),
         block_shape=(BLOCK_M, HEAD_DIM), order=(1, 0))
@@ -125,7 +128,7 @@ def _attn_fwd_sparse(Q, K, V, sm_scale,                         #
     # ----- epilogue -----
     m_i += tl.math.log2(l_i)
     acc = acc / l_i[:, None]
-    tl.store(M + off_hz * N_CTX + offs_m, m_i)
+    tl.store(M + off_hz * N_CTX_Q + offs_m, m_i)
     tl.store(O_ptr, acc.to(Out.type.element_ty))
 # ──────────────────────────── SPARSE ADDITION END ─────────────────────────────
 
@@ -516,15 +519,18 @@ def _attn_bwd_dq_kernel(Q, K, V, sm_scale,
 
 # ──────────────────────────── SPARSE ADDITION BEGIN ───────────────────────────
 def triton_block_sparse_attn_forward(q, k, v, q2k_index, q2k_num, variable_block_sizes):
-    B, H, T, D = q.shape
+    B, H, T_q, D = q.shape
+    _, _, T_kv, _ = k.shape
     sm_scale = 1.0 / math.sqrt(D)
     max_kv_blks = q2k_index.shape[-1]
-    assert T % 64 == 0, f"T must be a multiple of 64, but got {T}"
-    assert T // 64 == q2k_num.shape[-1], f"shape mismatch, T // 64 = {T // 64}, q2k_num.shape[-2] = {q2k_num.shape[-2]}"
-    o = torch.empty_like(q)
-    M = torch.empty((B, H, T), dtype=torch.float32, device=q.device)
+    assert T_q % 64 == 0, f"T_q must be a multiple of 64, but got {T_q}"
+    assert T_kv % 64 == 0, f"T_kv must be a multiple of 64, but got {T_kv}"
+    assert T_q // 64 == q2k_num.shape[-1], f"shape mismatch, T_q // 64 = {T_q // 64}, q2k_num.shape[-2] = {q2k_num.shape[-2]}"
 
-    grid = lambda _: (triton.cdiv(T, 64), B * H, 1)
+    o = torch.empty_like(q)
+    M = torch.empty((B, H, T_q), dtype=torch.float32, device=q.device)
+
+    grid = lambda _: (triton.cdiv(T_q, 64), B * H, 1)
     _attn_fwd_sparse[grid](
         q, k, v, sm_scale,
         q2k_index, q2k_num, max_kv_blks,
@@ -534,7 +540,7 @@ def triton_block_sparse_attn_forward(q, k, v, q2k_index, q2k_num, variable_block
         k.stride(0), k.stride(1), k.stride(2), k.stride(3),
         v.stride(0), v.stride(1), v.stride(2), v.stride(3),
         o.stride(0), o.stride(1), o.stride(2), o.stride(3),
-        B, H, T,
+        B, H, T_q, T_kv,
         HEAD_DIM=D, STAGE=3
     )
 
